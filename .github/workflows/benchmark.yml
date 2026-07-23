@@ -1,0 +1,106 @@
+# Benchmark workflow for the vitejs/vite fork.
+#
+# Workload derived from upstream .github/workflows/ci.yml, job "test"
+# (pnpm install -> build -> unit tests), simplified to a single linear job:
+# no OS/node-version matrix (node 20 only) and no playground e2e suites
+# (test-serve/test-build need browsers). See DECISIONS.md #7.
+#
+# Install this file at .github/workflows/benchmark.yml on the fork's
+# benchmark branch, alongside the vendored telemetry action at
+# .github/actions/telemetry/ (see SETUP.md / scripts/vendor_fork.py).
+#
+# Conventions shared by every fork's benchmark.yml:
+#   - runs-on is mapped from the `environment` input; adding an environment
+#     means adding one key to the fromJSON map below (see README).
+#   - Steps whose duration IS the workload are named "workload: ...". The
+#     orchestrator uses this prefix to tell workload failures (excluded with
+#     reason) from infra failures (retried).
+#   - cache_state=cold skips cache restore AND save entirely (DECISIONS.md #6).
+#     cache_state=warm uses the caching idiomatic to each environment:
+#     actions/cache on GitHub-hosted, useblacksmith/cache (colocated cache)
+#     on Blacksmith (DECISIONS.md #4). Warm cells are seeded by one excluded
+#     run that populates the cache (DECISIONS.md #5).
+
+name: benchmark
+run-name: "bench ${{ inputs.environment }} ${{ inputs.cache_state }} ${{ inputs.batch_id }} ${{ inputs.run_key }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Runner environment under test
+        type: choice
+        required: true
+        options: [github, github-8core, ec2, blacksmith]
+      cache_state:
+        description: cold = no caches, warm = environment-native caches
+        type: choice
+        required: true
+        options: [cold, warm]
+      batch_id:
+        description: Collection batch this run belongs to
+        type: string
+        required: true
+      run_key:
+        description: Unique key set by the orchestrator to find this run via the API
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: write # gha buildx cache scopes / cache writes
+
+jobs:
+  benchmark:
+    runs-on: ${{ fromJSON('{"github":"ubuntu-latest","github-8core":"benchmark-8core","ec2":"benchmark-ec2","blacksmith":"blacksmith-8vcpu-ubuntu-2404"}')[inputs.environment] }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start telemetry
+        uses: ./.github/actions/telemetry/start
+        continue-on-error: true
+        with:
+          runner_label: ${{ inputs.environment }}
+
+      # --- toolchain setup (not part of the measured workload steps, but ---
+      # --- inside job wall time on every environment equally)            ---
+      - uses: pnpm/action-setup@v4 # version from package.json "packageManager"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        shell: bash
+        run: echo "dir=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      # --- warm-cache restore, per environment ---
+      - name: Restore pnpm store (warm, GitHub-hosted)
+        if: inputs.cache_state == 'warm' && inputs.environment != 'blacksmith'
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.dir }}
+          key: bench-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Restore pnpm store (warm, Blacksmith)
+        if: inputs.cache_state == 'warm' && inputs.environment == 'blacksmith'
+        uses: useblacksmith/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.dir }}
+          key: bench-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+
+      # --- workload (mirrors upstream ci.yml "test" job) ---
+      - name: "workload: pnpm install"
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: "workload: build"
+        run: pnpm run build
+
+      - name: "workload: unit tests"
+        run: pnpm run test-unit
+
+      - name: Stop telemetry
+        if: always()
+        uses: ./.github/actions/telemetry/stop
