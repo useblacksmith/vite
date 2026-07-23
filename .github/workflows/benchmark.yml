@@ -1,13 +1,10 @@
 # Benchmark workflow for the vitejs/vite fork.
 #
-# Workload derived from upstream .github/workflows/ci.yml, job "test"
-# (pnpm install -> build -> unit tests), simplified to a single linear job:
-# no OS/node-version matrix (node 20 only) and no playground e2e suites
-# (test-serve/test-build need browsers). See DECISIONS.md #7.
-#
-# Install this file at .github/workflows/benchmark.yml on the fork's
-# benchmark branch, alongside the vendored telemetry action at
-# .github/actions/telemetry/ (see SETUP.md / scripts/vendor_fork.py).
+# Workload: the COMPLETE "test" job from upstream .github/workflows/ci.yml
+# (transcribed from upstream 2026-07-23 -- re-verify against the file at the
+# pinned commit), including Playwright browser install and the test-serve /
+# test-build e2e suites. One matrix leg is run: ubuntu + node 24 (the leg
+# upstream marks as active LTS). Nothing else is cut.
 #
 # Conventions shared by every fork's benchmark.yml:
 #   - runs-on is mapped from the `environment` input; adding an environment
@@ -15,10 +12,10 @@
 #   - Steps whose duration IS the workload are named "workload: ...". The
 #     orchestrator uses this prefix to tell workload failures (excluded with
 #     reason) from infra failures (retried).
-#   - cache_state=cold skips cache restore AND save entirely (DECISIONS.md #6).
-#     cache_state=warm uses the caching idiomatic to each environment:
-#     actions/cache on GitHub-hosted, useblacksmith/cache (colocated cache)
-#     on Blacksmith (DECISIONS.md #4). Warm cells are seeded by one excluded
+#   - cache_state=cold skips cache restore AND save (DECISIONS.md #6);
+#     cache_state=warm uses upstream's own cache mechanism (here: setup-node
+#     pnpm cache + the Playwright binary cache), which Blacksmith accelerates
+#     transparently (DECISIONS.md #4). Warm cells are seeded by one excluded
 #     run that populates the cache (DECISIONS.md #5).
 
 name: benchmark
@@ -33,7 +30,7 @@ on:
         required: true
         options: [github, github-8core, ec2, blacksmith]
       cache_state:
-        description: cold = no caches, warm = environment-native caches
+        description: cold = no caches, warm = upstream cache configuration
         type: choice
         required: true
         options: [cold, warm]
@@ -48,14 +45,22 @@ on:
 
 permissions:
   contents: read
-  actions: write # gha buildx cache scopes / cache writes
+
+# Upstream ci.yml global env, verbatim.
+env:
+  NODE_OPTIONS: --max-old-space-size=6144
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  VITEST_SEGFAULT_RETRY: 3
 
 jobs:
   benchmark:
     runs-on: ${{ fromJSON('{"github":"ubuntu-latest","github-8core":"benchmark-8core","ec2":"benchmark-ec2","blacksmith":"blacksmith-8vcpu-ubuntu-2404"}')[inputs.environment] }}
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Start telemetry
         uses: ./.github/actions/telemetry/start
@@ -63,43 +68,50 @@ jobs:
         with:
           runner_label: ${{ inputs.environment }}
 
-      # --- toolchain setup (not part of the measured workload steps, but ---
-      # --- inside job wall time on every environment equally)            ---
-      - uses: pnpm/action-setup@v4 # version from package.json "packageManager"
+      # --- upstream "test" job steps, in upstream order ---
 
-      - uses: actions/setup-node@v4
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set node version to 24
+        uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
+          # upstream: cache: "pnpm" -- made conditional for cold/warm control
+          cache: ${{ inputs.cache_state == 'warm' && 'pnpm' || '' }}
 
-      - name: Resolve pnpm store path
-        id: pnpm-store
-        shell: bash
-        run: echo "dir=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - name: "workload: Install deps"
+        run: pnpm install
 
-      # --- warm-cache restore, per environment ---
-      - name: Restore pnpm store (warm, GitHub-hosted)
-        if: inputs.cache_state == 'warm' && inputs.environment != 'blacksmith'
-        uses: actions/cache@v4
+      - name: Set Playwright path and Get playwright version
+        run: |
+          echo "PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache/playwright-bin" >> $GITHUB_ENV
+          PLAYWRIGHT_VERSION="$(pnpm ls --depth 0 --json -w playwright-chromium | jq --raw-output '.[0].devDependencies["playwright-chromium"].version')"
+          echo "PLAYWRIGHT_VERSION=$PLAYWRIGHT_VERSION" >> $GITHUB_ENV
+
+      - name: Cache Playwright's binary
+        if: inputs.cache_state == 'warm'
+        uses: actions/cache@v6
         with:
-          path: ${{ steps.pnpm-store.outputs.dir }}
-          key: bench-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          key: ${{ runner.os }}-playwright-bin-v1-${{ env.PLAYWRIGHT_VERSION }}
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-bin-v1-
 
-      - name: Restore pnpm store (warm, Blacksmith)
-        if: inputs.cache_state == 'warm' && inputs.environment == 'blacksmith'
-        uses: useblacksmith/cache@v5
-        with:
-          path: ${{ steps.pnpm-store.outputs.dir }}
-          key: bench-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+      - name: "workload: Install Playwright"
+        run: pnpm playwright install chromium
 
-      # --- workload (mirrors upstream ci.yml "test" job) ---
-      - name: "workload: pnpm install"
-        run: pnpm install --frozen-lockfile --prefer-offline
-
-      - name: "workload: build"
+      - name: "workload: Build"
         run: pnpm run build
 
-      - name: "workload: unit tests"
+      - name: "workload: Test unit"
         run: pnpm run test-unit
+
+      - name: "workload: Test serve"
+        run: pnpm run test-serve
+
+      - name: "workload: Test build"
+        run: pnpm run test-build
 
       - name: Stop telemetry
         if: always()
